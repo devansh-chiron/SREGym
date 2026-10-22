@@ -232,6 +232,12 @@ def object_candidates(ctx: AgentContext, notebook: Notebook, scores: dict[str, f
         key=lambda c: (c not in named, c not in abnormal_targets, -scores.get(c, 0.0), c),
     )
     out: dict[str, str] = {}
+    if ctx.extra.get("chiron"):
+        suspects = ctx.extra.get("chiron_suspects") or {}
+        if isinstance(suspects, dict):
+            for sid, desc in suspects.items():
+                if isinstance(sid, str) and isinstance(desc, str) and sid.count("/") in (1, 2):
+                    out.setdefault(sid, desc)
     for cid in focus:
         comp = comps.get(cid)
         if not isinstance(comp, dict):

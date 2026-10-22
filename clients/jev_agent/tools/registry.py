@@ -11,6 +11,15 @@ from clients.jev_agent.tools.cluster_objects import run_cluster_objects
 from clients.jev_agent.tools.config_changes import run_config_and_changes
 from clients.jev_agent.tools.describe import run_describe
 from clients.jev_agent.tools.events import _scope_applicable, run_events
+from clients.jev_agent.tools.chiron import (
+    chiron_applicable,
+    chiron_component_applicable,
+    run_active_alerts,
+    run_chiron_changes,
+    run_chiron_onset_order,
+    run_chiron_symptoms,
+    run_k8s_changes,
+)
 from clients.jev_agent.tools.logs import run_logs
 from clients.jev_agent.tools.metric_series import _metric_runner
 from clients.jev_agent.tools.objects import run_object_view, run_related_objects
@@ -149,5 +158,19 @@ REGISTRY: dict[str, ToolSpec] = {
         reveals="recent Kubernetes events of all types for the scope, grouped by reason, Warning groups first, newest first",
         run=run_events,
         applicable=_scope_applicable,
+    ),
+    "k8s_changes": ToolSpec(
+        name="k8s_changes",
+        target_kind=SCOPE,
+        reveals="Kubernetes field changes Chiron recorded for this scope: object, field, old value, new value, and when",
+        run=run_k8s_changes,
+        applicable=chiron_applicable,
+    ),
+    "active_alerts": ToolSpec(
+        name="active_alerts",
+        target_kind=SCOPE,
+        reveals="alerts Chiron currently holds for this scope, with the rule name and the object that fired",
+        run=run_active_alerts,
+        applicable=chiron_applicable,
     ),
 }

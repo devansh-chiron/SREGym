@@ -391,6 +391,8 @@ def _collect_session(args, cfg, trace, prefix: Path, app_info: dict, namespaces:
         cache=cache,
         extra={"change_window_s": cfg.change_window_s},
     )
+    if cfg.chiron:
+        ctx.extra["chiron"] = True
     notebook = Notebook(
         app_info,
         rendered,
@@ -398,6 +400,15 @@ def _collect_session(args, cfg, trace, prefix: Path, app_info: dict, namespaces:
         rerender=lambda b: overview_mod.render(overview, budget_tokens=b),
         hints=overview_hints(overview),
     )
+    if cfg.chiron:
+        from clients.jev_agent.tools.chiron import fetch_incident_brief, suspects_from_brief
+
+        suspects = ctx.extra.setdefault("chiron_suspects", {})
+        for ns in namespaces or ["default"]:
+            brief = fetch_incident_brief(ns)
+            notebook.add(0, "incident_brief", ns, brief)
+            if isinstance(suspects, dict):
+                suspects.update(suspects_from_brief(brief))
     return _Session(snapshot, overview, scores, ctx, cache, notebook, mcp_ok, span_label)
 
 

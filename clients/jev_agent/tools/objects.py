@@ -183,7 +183,9 @@ def run_object_view(ctx: AgentContext, target: str) -> ToolResult:
 
 def object_targets(ctx: AgentContext) -> list[str]:
     """Objects worth viewing: the origin candidates the policy lists, then objects changed recently."""
-    out = list(ctx.extra.get("origin_objects") or [])
+    suspects = ctx.extra.get("chiron_suspects") or {}
+    out = list(suspects) if isinstance(suspects, dict) else list(suspects or [])
+    out.extend(ctx.extra.get("origin_objects") or [])
     for change in ((ctx.overview or {}).get("cluster") or {}).get("recent_changes") or []:
         if isinstance(change, dict) and change.get("object"):
             out.append(change["object"])

@@ -843,7 +843,10 @@ def main(args):
         # Exported before the judge bridge starts so a CLI judge receives it too.
         os.environ["JUDGE_REASONING_EFFORT"] = judge_effort
     backend = "api" if args.use_external_harness else getattr(args, "judge_backend", "api")
-    with managed_judge_backend(backend, force_build=args.force_build) as agent_image:
+    with managed_judge_backend(backend, force_build=args.force_build) as judge_image:
+        # The Cursor judge image does not contain other agents. Reuse it only
+        # when the evaluated agent is Cursor itself.
+        agent_image = judge_image if args.agent == "cursor" else "sregym-agent-base:latest"
         return _run_benchmark(args, judge_backend=backend, agent_image=agent_image)
 
 
