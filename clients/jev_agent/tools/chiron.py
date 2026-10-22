@@ -131,58 +131,68 @@ def _suspect_id(kind: str, namespace: str | None, name: str) -> str:
     return f"{kind_id}/{name}"
 
 
+# Objects created by a controller from another object: blaming them names a symptom of the
+# change, not the change. The owner is named instead when the brief gives it.
+_DERIVED_KINDS = {"EndpointSlice", "Endpoints", "ReplicaSet"}
+_WORKLOAD_RE = re.compile(rf"\bworkload ({_KIND_ALT})/([A-Za-z0-9._-]+)")
+MAX_SUSPECTS = 3
+
+
 def _suspect_desc(kind: str, namespace: str | None, name: str, line: str) -> str:
     where = f"{namespace}/{name}" if namespace else name
     return shorten(
-        f"{kind} {where} is where the fault originates: Chiron recorded {line}"
+        f"{kind} {where}, which Chiron recorded changing shortly before the first symptom: {line}"
     )
 
 
+def _most_likely_objects(line: str) -> list[tuple[str, str | None, str]]:
+    """(kind, namespace, name) for the changed object a MOST LIKELY line names, owner first for derived kinds."""
+    out: list[tuple[str, str | None, str]] = []
+    for namespace, kind, name in _TAG_RE.findall(line):
+        out.append((kind, namespace, name))
+    if not out:
+        match = _NAMED_RE.search(line)
+        if match:
+            out.append((match.group(1), match.group(2), match.group(3)))
+        else:
+            match = _CLUSTER_RE.search(line)
+            if match:
+                out.append((match.group(1), None, match.group(2)))
+    resolved: list[tuple[str, str | None, str]] = []
+    for kind, namespace, name in out:
+        if kind in _DERIVED_KINDS:
+            owner = _WORKLOAD_RE.search(line)
+            if not owner:
+                continue
+            kind, name = owner.group(1), owner.group(2)
+        resolved.append((kind, namespace, name))
+    return resolved
+
+
 def suspects_from_brief(result: ToolResult) -> dict[str, str]:
-    """Objects named in MOST LIKELY and LIKELY CAUSES, as origin ids the policy already uses."""
+    """The object the brief's MOST LIKELY line names, as an origin choice.
+
+    Only MOST LIKELY: the brief has already ranked it against the other changes, and
+    every extra choice is one more plausible wrong answer for Jev. Derived objects
+    (EndpointSlice, ReplicaSet) are replaced by their owner or dropped.
+    """
     text = ""
     if isinstance(result.raw, dict):
         text = _brief_text(result.raw)
     if not text:
         text = "\n".join(result.lines or [])
-    interesting: list[str] = []
-    current: str | None = None
+    found: dict[str, str] = {}
     for raw in text.splitlines():
         line = raw.strip()
-        if not line:
+        if not line.startswith("MOST LIKELY"):
             continue
-        if line.startswith("MOST LIKELY") or line.startswith("LIKELY CAUSES"):
-            current = "keep"
-            if line.startswith("MOST LIKELY"):
-                interesting.append(line)
-            continue
-        if line.startswith("SYMPTOMS") or line.startswith("EARLIER, NOW QUIET"):
-            current = None
-            continue
-        if current:
-            interesting.append(line)
-    found: dict[str, str] = {}
-    for line in interesting:
-        for namespace, kind, name in _TAG_RE.findall(line):
-            sid = _suspect_id(kind, namespace, name)
-            found.setdefault(sid, _suspect_desc(kind, namespace, name, line))
-        if _TAG_RE.search(line):
-            continue
-        named = list(_NAMED_RE.finditer(line))
-        if named:
-            for match in named:
-                kind, namespace, name = match.group(1), match.group(2), match.group(3)
-                sid = _suspect_id(kind, namespace, name)
-                found.setdefault(sid, _suspect_desc(kind, namespace, name, line))
-            continue
-        match = _CLUSTER_RE.search(line)
-        if match:
-            kind, name = match.group(1), match.group(2)
-            sid = _suspect_id(kind, None, name)
-            found.setdefault(sid, _suspect_desc(kind, None, name, line))
-        if len(found) >= MAX_FINDINGS:
+        # Only the change, not the symptom quoted after it.
+        change = line.split("; ", 1)[0]
+        for kind, namespace, name in _most_likely_objects(change):
+            found.setdefault(_suspect_id(kind, namespace, name), _suspect_desc(kind, namespace, name, line))
+        if len(found) >= MAX_SUSPECTS:
             break
-    return found
+    return dict(list(found.items())[:MAX_SUSPECTS])
 
 
 def _change_lines(payload: object) -> list[str]:
