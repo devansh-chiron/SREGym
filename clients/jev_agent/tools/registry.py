@@ -173,4 +173,25 @@ REGISTRY: dict[str, ToolSpec] = {
         run=run_active_alerts,
         applicable=chiron_applicable,
     ),
+    "chiron_changes": ToolSpec(
+        name="chiron_changes",
+        target_kind=COMPONENT,
+        reveals="Chiron-recorded field changes for this workload and the objects it uses, old to new, one fact per line",
+        run=run_chiron_changes,
+        applicable=chiron_component_applicable,
+    ),
+    "chiron_symptoms": ToolSpec(
+        name="chiron_symptoms",
+        target_kind=COMPONENT,
+        reveals="this workload symptoms Chiron already computed: alerts, first seen, still active",
+        run=run_chiron_symptoms,
+        applicable=chiron_component_applicable,
+    ),
+    "chiron_onset_order": ToolSpec(
+        name="chiron_onset_order",
+        target_kind=SCOPE,
+        reveals="workloads in the order Chiron first saw their symptoms in this namespace",
+        run=run_chiron_onset_order,
+        applicable=chiron_applicable,
+    ),
 }
