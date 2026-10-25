@@ -5,6 +5,10 @@ definitions stay. reset-all is not used: it also deletes every history
 snapshot directory, including sregym-lite. The namespace prefix reset is not
 used either: its snapshot cleanup deletes any session directory whose name
 starts with that prefix.
+
+After the reset, live telemetry may create new rows immediately. Those rows
+are kept. A row is rejected only when its first-seen time, or its creation
+time when the rule does not store first-seen, is before the reset.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 DEFAULT_RHEOS = "https://devansh.demo.chironvision.com:32443/rheos"
@@ -78,13 +83,13 @@ def _http(method: str, url: str, token: str | None = None, payload: dict | None 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, context=_SSL, timeout=timeout) as response:
-            return response.status, response.read()
+            return response.status, response.read(), response.headers
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        return error.code, error.read(), error.headers
 
 
 def _json(method: str, url: str, token: str | None = None, payload: dict | None = None) -> dict:
-    status, body = _http(method, url, token=token, payload=payload)
+    status, body, _headers = _http(method, url, token=token, payload=payload)
     if status != 200:
         raise RuntimeError(f"{method} {url} failed: {status} {body[:300]!r}")
     if not body:
@@ -183,12 +188,69 @@ def _triggered_alert_count(base: str, token: str) -> int:
     return len(batch)
 
 
-def _row_count(base: str, token: str, rule_id: str) -> int:
-    state = _json("GET", f"{base}/api/mnemosyne/tables/{rule_id}/state", token=token)
-    if "row_count" in state:
-        return int(state["row_count"])
-    rows = state.get("rows") or []
-    return len(rows) if isinstance(rows, list) else 0
+def _server_date_ms(headers) -> int:
+    raw = headers.get("Date") if headers is not None else None
+    if not raw:
+        raise RuntimeError("Rheos response has no Date header")
+    parsed = parsedate_to_datetime(raw)
+    if parsed is None:
+        raise RuntimeError(f"Rheos Date header is not a time: {raw!r}")
+    return int(parsed.timestamp() * 1000)
+
+
+def _column_millis(column) -> int | None:
+    """Epoch millis stored in a debug-state column, when the column is set."""
+    if not isinstance(column, dict) or column.get("initialized") is False:
+        return None
+    value = column.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    millis = int(value)
+    if millis < 1_000_000_000_000:
+        return None
+    return millis
+
+
+def _row_origin_ms(row: dict) -> int | None:
+    """When this row was first seen, or created if the rule has no first-seen column.
+
+    Rules that store first-seen use a `first_*` column (`first_at` in the DSL).
+    Other rules only have `last_updated_time`, which Rheos writes when it
+    creates the row.
+    """
+    columns = row.get("columns") if isinstance(row.get("columns"), dict) else {}
+    first_seen: list[int] = []
+    for name, column in columns.items():
+        if not isinstance(name, str):
+            continue
+        if name.startswith("first_") or name in {"created_at", "creation_time"}:
+            millis = _column_millis(column)
+            if millis is not None:
+                first_seen.append(millis)
+    if first_seen:
+        return min(first_seen)
+    return _column_millis(columns.get("last_updated_time"))
+
+
+def _rows_born_before(base: str, token: str, rules: list[dict], reset_ms: int) -> tuple[dict, int]:
+    stale: dict[str, list[dict]] = {}
+    rows_after = 0
+    for rule in rules:
+        state = _json("GET", f"{base}/api/mnemosyne/tables/{_rule_id(rule)}/state", token=token)
+        rows = state.get("rows") or []
+        if not isinstance(rows, list):
+            raise RuntimeError(f"Rule {rule.get('name')} state has no rows array")
+        rows_after += len(rows)
+        old: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            origin = _row_origin_ms(row)
+            if origin is None or origin < reset_ms:
+                old.append({"row_key": row.get("row_key"), "origin_ms": origin})
+        if old:
+            stale[str(rule.get("name"))] = old
+    return stale, rows_after
 
 
 def _history_session(base: str, token: str) -> dict:
@@ -227,37 +289,56 @@ def reset_rheos_for_namespaces(namespaces: list[str]) -> dict:
 
     alert_ids = _list_alert_ids(base, token)
     alerts_deleted = _delete_alert_ids(base, token, alert_ids)
+    query = urllib.parse.urlencode({"sessionPrefix": HISTORY_SESSION})
+    status, _body, headers = _http("GET", f"{base}/api/v1/history/sessions?{query}", token=token)
+    if status != 200:
+        raise RuntimeError(f"History session read before reset failed: {status}")
+    reset_ms = _server_date_ms(headers)
     rows_cleared = 0
     for rule in rules:
         rule_id = _rule_id(rule)
         reset = _json("POST", f"{base}/api/mnemosyne/tables/{rule_id}/reset", token=token)
         rows_cleared += int(reset.get("rows_cleared") or 0)
 
+    remaining_alerts = _list_alert_ids(base, token)
     triggered = _triggered_alert_count(base, token)
-    nonempty = {
-        str(rule.get("name")): _row_count(base, token, _rule_id(rule))
-        for rule in sregym
-        if _row_count(base, token, _rule_id(rule)) > 0
-    }
+    stale, rows_after = _rows_born_before(base, token, rules, reset_ms)
+    rules_after = _list_rules(base, token)
+    sregym_after = [
+        rule for rule in rules_after if str(rule.get("groupName") or "").startswith(SREGYM_GROUP_PREFIX)
+    ]
     history_after = _history_session(base, token)
     ticks_after = int(history_after.get("tick_count") or 0)
+    if remaining_alerts:
+        raise RuntimeError(f"{len(remaining_alerts)} alerts remain after reset")
+    if triggered:
+        raise RuntimeError(f"{triggered} triggered alerts remain after reset")
+    if stale:
+        summary = {
+            name: {"count": len(rows), "sample": rows[:3]}
+            for name, rows in stale.items()
+        }
+        raise RuntimeError(f"Rows first seen before the reset remain: {summary}")
+    if len(rules_after) != len(rules) or len(sregym_after) != len(sregym):
+        raise RuntimeError(
+            f"Reset changed the rule definitions ({len(rules)} -> {len(rules_after)}, "
+            f"SREGYM {len(sregym)} -> {len(sregym_after)})"
+        )
     if ticks_after < ticks_before:
         raise RuntimeError(
             f"History session {HISTORY_SESSION} dropped from {ticks_before} to {ticks_after} ticks"
         )
-    if triggered:
-        raise RuntimeError(f"{triggered} triggered alerts remain after reset")
-    if nonempty:
-        raise RuntimeError(f"SREGYM rule state is not empty after reset: {nonempty}")
-    if len(_list_rules(base, token)) != len(rules):
-        raise RuntimeError("Reset changed the number of rule definitions")
 
     return {
         "namespaces": cleaned,
         "rules_reset": len(rules),
         "sregym_rules": len(sregym),
         "rows_cleared": rows_cleared,
+        "rows_after": rows_after,
+        "rows_born_before_reset": 0,
+        "reset_ms": reset_ms,
         "alerts_deleted": alerts_deleted,
+        "alerts_remaining": 0,
         "triggered_alerts_after": triggered,
         "history_session": HISTORY_SESSION,
         "history_ticks_before": ticks_before,
