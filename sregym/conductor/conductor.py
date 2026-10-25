@@ -307,17 +307,17 @@ class Conductor:
             )
 
     def _reset_rheos_before_baseline(self):
-        """Clear this problem's Rheos rows and SREGYM alerts before the steady-state window.
+        """Delete all alerts and clear every rule's in-memory state before the steady-state window.
 
-        Both arms come through this path. The reset is the current problem's
-        namespace only; it does not call reset-all.
+        Both arms come through this path. Rule definitions and the sregym-lite
+        history session stay. reset-all is not used.
         """
         from sregym.conductor.rheos_reset import problem_namespaces, reset_rheos_for_namespaces
 
         namespaces = problem_namespaces(self.app)
         if not namespaces:
             raise RuntimeError(f"No namespace for {self.problem_id}; refusing to start the baseline")
-        self.logger.info(f"[BASELINE] Resetting Rheos rows and SREGYM alerts for {namespaces}")
+        self.logger.info(f"[BASELINE] Deleting all alerts and clearing every rule's in-memory state for {namespaces}")
         summary = reset_rheos_for_namespaces(namespaces)
         self.logger.info(f"[BASELINE] Rheos reset complete: {summary}")
 

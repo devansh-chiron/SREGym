@@ -1,8 +1,10 @@
 """Per-problem Rheos reset used by both SREGym arms.
 
-Clears Mnemosyne rows for the problem namespace and deletes SREGYM alerts for
-that namespace. Never calls reset-all, and never deletes an alert whose rule
-is outside the SREGYM groups.
+Deletes every alert and clears in-memory rows for every live rule. Rule
+definitions stay. reset-all is not used: it also deletes every history
+snapshot directory, including sregym-lite. The namespace prefix reset is not
+used either: its snapshot cleanup deletes any session directory whose name
+starts with that prefix.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from pathlib import Path
 DEFAULT_RHEOS = "https://devansh.demo.chironvision.com:32443/rheos"
 CREDENTIALS_FILE = Path.home() / ".config" / "sregym" / "rheos.env"
 SREGYM_GROUP_PREFIX = "SREGYM_"
+HISTORY_SESSION = "sregym-lite"
+EXPECTED_SREGYM_RULES = 13
 _SSL = ssl.create_default_context()
 
 
@@ -74,8 +78,7 @@ def _http(method: str, url: str, token: str | None = None, payload: dict | None 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, context=_SSL, timeout=timeout) as response:
-            body = response.read()
-            return response.status, body
+            return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
 
@@ -104,46 +107,46 @@ def _login(base: str, username: str, password: str) -> str:
     return token
 
 
-def _sregym_rule_ids(base: str, token: str) -> set[str]:
-    parsed = _json("GET", f"{base}/api/v1/rules", token=token)
-    rules = parsed.get("data") or parsed.get("rules") or []
-    if not isinstance(rules, list):
-        raise RuntimeError("Rheos rule list has no data array")
-    ids: set[str] = set()
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        group = str(rule.get("groupName") or rule.get("group") or "")
-        rule_id = rule.get("id") or rule.get("ruleId")
-        if group.startswith(SREGYM_GROUP_PREFIX) and rule_id:
-            ids.add(str(rule_id))
-    if not ids:
-        raise RuntimeError("No SREGYM rules are deployed; refusing to guess which alerts to delete")
-    return ids
-
-
-def _alerts_for_namespace(base: str, token: str, namespace: str) -> list[dict]:
-    alerts: list[dict] = []
+def _list_rules(base: str, token: str) -> list[dict]:
+    rules: list[dict] = []
     page = 1
     while True:
-        query = urllib.parse.urlencode(
-            {"instanceKeyPrefix": namespace, "limit": 500, "page": page}
-        )
+        parsed = _json("GET", f"{base}/api/v1/rules?limit=200&page={page}", token=token)
+        batch = parsed.get("data") or []
+        if not isinstance(batch, list):
+            raise RuntimeError("Rheos rule list has no data array")
+        rules.extend(item for item in batch if isinstance(item, dict))
+        if not (parsed.get("pagination") or {}).get("hasNextPage"):
+            return rules
+        page += 1
+
+
+def _rule_id(rule: dict) -> str:
+    rule_id = rule.get("id") or rule.get("ruleId")
+    if not rule_id:
+        raise RuntimeError(f"Rule {rule.get('name')} has no id")
+    return str(rule_id)
+
+
+def _list_alert_ids(base: str, token: str) -> list[str]:
+    ids: list[str] = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode({"limit": 500, "page": page})
         parsed = _json("GET", f"{base}/api/v1/alerts?{query}", token=token)
         batch = parsed.get("data") or []
         if not isinstance(batch, list):
             raise RuntimeError("Rheos alert list has no data array")
-        alerts.extend(item for item in batch if isinstance(item, dict))
-        pagination = parsed.get("pagination") or {}
-        if not pagination.get("hasNextPage"):
-            return alerts
+        ids.extend(str(alert["alertId"]) for alert in batch if isinstance(alert, dict) and alert.get("alertId"))
+        if not (parsed.get("pagination") or {}).get("hasNextPage"):
+            return ids
         page += 1
 
 
 def _alert_delete_ok(outcome) -> bool:
     """Rheos returns {"success": {...}} or {"error": {...}} per alert id.
 
-    An alert that no longer exists (expired or deleted concurrently) counts as done.
+    An alert that no longer exists counts as done.
     """
     if not isinstance(outcome, dict):
         return False
@@ -157,24 +160,48 @@ def _alert_delete_ok(outcome) -> bool:
     return False
 
 
-def _delete_sregym_alerts(base: str, token: str, namespace: str, rule_ids: set[str]) -> tuple[int, int]:
-    alerts = _alerts_for_namespace(base, token, namespace)
-    delete_ids = [str(alert["alertId"]) for alert in alerts if str(alert.get("ruleId")) in rule_ids and alert.get("alertId")]
-    skipped = len(alerts) - len(delete_ids)
+def _delete_alert_ids(base: str, token: str, alert_ids: list[str]) -> int:
     deleted = 0
-    for start in range(0, len(delete_ids), 200):
-        chunk = delete_ids[start : start + 200]
+    for start in range(0, len(alert_ids), 200):
+        chunk = alert_ids[start : start + 200]
         result = _json("DELETE", f"{base}/api/v1/alerts", token=token, payload={"ids": chunk})
         for alert_id in chunk:
             if _alert_delete_ok(result.get(alert_id)):
                 deleted += 1
                 continue
-            raise RuntimeError(f"Failed to delete SREGYM alert {alert_id} in {namespace}: {result.get(alert_id)!r}")
-    return deleted, skipped
+            raise RuntimeError(f"Failed to delete alert {alert_id}: {result.get(alert_id)!r}")
+    return deleted
+
+
+def _triggered_alert_count(base: str, token: str) -> int:
+    query = urllib.parse.urlencode({"status": "TRIGGERED", "limit": 1, "page": 1})
+    parsed = _json("GET", f"{base}/api/v1/alerts?{query}", token=token)
+    pagination = parsed.get("pagination") or {}
+    if "total" in pagination:
+        return int(pagination["total"])
+    batch = parsed.get("data") or []
+    return len(batch)
+
+
+def _row_count(base: str, token: str, rule_id: str) -> int:
+    state = _json("GET", f"{base}/api/mnemosyne/tables/{rule_id}/state", token=token)
+    if "row_count" in state:
+        return int(state["row_count"])
+    rows = state.get("rows") or []
+    return len(rows) if isinstance(rows, list) else 0
+
+
+def _history_session(base: str, token: str) -> dict:
+    query = urllib.parse.urlencode({"sessionPrefix": HISTORY_SESSION})
+    parsed = _json("GET", f"{base}/api/v1/history/sessions?{query}", token=token)
+    for session in parsed.get("sessions") or []:
+        if isinstance(session, dict) and session.get("session") == HISTORY_SESSION:
+            return session
+    raise RuntimeError(f"History session {HISTORY_SESSION} is missing")
 
 
 def reset_rheos_for_namespaces(namespaces: list[str]) -> dict:
-    """Prefix-reset Mnemosyne and delete SREGYM alerts for each namespace."""
+    """Delete all alerts and clear every live rule's in-memory state."""
     cleaned = []
     for namespace in namespaces:
         if not isinstance(namespace, str) or not namespace.strip():
@@ -187,19 +214,52 @@ def reset_rheos_for_namespaces(namespaces: list[str]) -> dict:
 
     base, username, password = rheos_settings()
     token = _login(base, username, password)
-    rule_ids = _sregym_rule_ids(base, token)
-    results = []
-    for namespace in cleaned:
-        query = urllib.parse.urlencode({"instanceKeyPrefix": namespace})
-        reset = _json("POST", f"{base}/api/mnemosyne/reset?{query}", token=token)
-        deleted, skipped = _delete_sregym_alerts(base, token, namespace, rule_ids)
-        results.append(
-            {
-                "namespace": namespace,
-                "rows_cleared": reset.get("rows_cleared"),
-                "tables_touched": reset.get("tables_touched"),
-                "alerts_deleted": deleted,
-                "alerts_left_untouched": skipped,
-            }
+    rules = _list_rules(base, token)
+    sregym = [rule for rule in rules if str(rule.get("groupName") or "").startswith(SREGYM_GROUP_PREFIX)]
+    if len(sregym) != EXPECTED_SREGYM_RULES:
+        raise RuntimeError(
+            f"Expected {EXPECTED_SREGYM_RULES} SREGYM rules before reset, found {len(sregym)}"
         )
-    return {"namespaces": results}
+    history_before = _history_session(base, token)
+    ticks_before = int(history_before.get("tick_count") or 0)
+    if ticks_before <= 0:
+        raise RuntimeError(f"History session {HISTORY_SESSION} has no ticks; refusing to reset")
+
+    alert_ids = _list_alert_ids(base, token)
+    alerts_deleted = _delete_alert_ids(base, token, alert_ids)
+    rows_cleared = 0
+    for rule in rules:
+        rule_id = _rule_id(rule)
+        reset = _json("POST", f"{base}/api/mnemosyne/tables/{rule_id}/reset", token=token)
+        rows_cleared += int(reset.get("rows_cleared") or 0)
+
+    triggered = _triggered_alert_count(base, token)
+    nonempty = {
+        str(rule.get("name")): _row_count(base, token, _rule_id(rule))
+        for rule in sregym
+        if _row_count(base, token, _rule_id(rule)) > 0
+    }
+    history_after = _history_session(base, token)
+    ticks_after = int(history_after.get("tick_count") or 0)
+    if ticks_after < ticks_before:
+        raise RuntimeError(
+            f"History session {HISTORY_SESSION} dropped from {ticks_before} to {ticks_after} ticks"
+        )
+    if triggered:
+        raise RuntimeError(f"{triggered} triggered alerts remain after reset")
+    if nonempty:
+        raise RuntimeError(f"SREGYM rule state is not empty after reset: {nonempty}")
+    if len(_list_rules(base, token)) != len(rules):
+        raise RuntimeError("Reset changed the number of rule definitions")
+
+    return {
+        "namespaces": cleaned,
+        "rules_reset": len(rules),
+        "sregym_rules": len(sregym),
+        "rows_cleared": rows_cleared,
+        "alerts_deleted": alerts_deleted,
+        "triggered_alerts_after": triggered,
+        "history_session": HISTORY_SESSION,
+        "history_ticks_before": ticks_before,
+        "history_ticks_after": ticks_after,
+    }
