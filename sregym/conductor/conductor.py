@@ -306,6 +306,21 @@ class Conductor:
                 "No stages left after checking oracles. This problem will complete without agent interaction."
             )
 
+    def _reset_rheos_before_baseline(self):
+        """Clear this problem's Rheos rows and SREGYM alerts before the steady-state window.
+
+        Both arms come through this path. The reset is the current problem's
+        namespace only; it does not call reset-all.
+        """
+        from sregym.conductor.rheos_reset import problem_namespaces, reset_rheos_for_namespaces
+
+        namespaces = problem_namespaces(self.app)
+        if not namespaces:
+            raise RuntimeError(f"No namespace for {self.problem_id}; refusing to start the baseline")
+        self.logger.info(f"[BASELINE] Resetting Rheos rows and SREGYM alerts for {namespaces}")
+        summary = reset_rheos_for_namespaces(namespaces)
+        self.logger.info(f"[BASELINE] Rheos reset complete: {summary}")
+
     def _inject_fault(self):
         """Inject fault and prepare diagnosis checkpoint if available."""
         problem = self.current_problem
@@ -713,6 +728,7 @@ class Conductor:
         if baseline > 0:
             self.logger.info(f"[BASELINE] Running steady-state for {baseline}s before fault injection...")
             with self._phase("baseline", seconds=baseline):
+                self._reset_rheos_before_baseline()
                 await asyncio.sleep(baseline)
             self.logger.info("[BASELINE] Baseline period complete.")
 
