@@ -1,7 +1,8 @@
 """Suspect ids and brief section order. Made-up objects, not a live incident."""
 
+from clients.jev_agent.policy import _origin_criteria
 from clients.jev_agent.tools.chiron import SECTION_ORDER, brief_lines, suspects_from_brief
-from clients.jev_agent.types import ToolResult
+from clients.jev_agent.types import AgentContext, ToolResult
 
 
 def test_section_order_puts_background_last():
@@ -40,6 +41,52 @@ def test_deployment_in_the_app_namespace_is_one_suspect_id():
 
     fallback = ToolResult(lines=[brief], raw={"brief": brief})
     assert list(suspects_from_brief(fallback, "app")) == ["deployment/web"]
+
+
+def test_aux_service_is_one_origin_choice():
+    """A workload named kind/namespace/name is the same origin as kind/name, once."""
+    from clients.jev_agent.notebook import Notebook
+
+    brief = "MOST LIKELY: Deployment hotel-reservation/aux-service created at 07:17:11Z"
+    suspects = suspects_from_brief(
+        ToolResult(
+            lines=[brief],
+            raw={
+                "brief": brief,
+                "suspects": [{"kind": "Deployment", "namespace": "hotel-reservation", "name": "aux-service"}],
+            },
+        ),
+        "hotel-reservation",
+    )
+    assert list(suspects) == ["deployment/aux-service"]
+
+    class _Snap:
+        components = {
+            "deployment/aux-service": {
+                "namespace": "hotel-reservation",
+                "name": "aux-service",
+                "kind": "Deployment",
+                "services": [{"name": "aux-service"}],
+                "containers": [],
+            }
+        }
+
+    ctx = AgentContext(
+        app_info={},
+        namespaces=["hotel-reservation"],
+        snapshot=_Snap(),
+        overview={
+            "cluster": {
+                "recent_changes": [
+                    {"object": "deployment/hotel-reservation/aux-service", "seconds_ago": 10},
+                ]
+            }
+        },
+        extra={"chiron": True, "chiron_suspects": suspects, "change_window_s": 1800},
+    )
+    criteria = _origin_criteria(ctx, Notebook({}, {}), {"deployment/aux-service": 1.0})
+    deployment_ids = [key for key in criteria if key.startswith("deployment/") and key.endswith("aux-service")]
+    assert deployment_ids == ["deployment/aux-service"]
 
 
 def test_command_array_is_not_a_suspect():

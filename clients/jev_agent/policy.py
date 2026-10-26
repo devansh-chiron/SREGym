@@ -217,6 +217,8 @@ def object_candidates(ctx: AgentContext, notebook: Notebook, scores: dict[str, f
     """Non-workload objects that can be named as the origin, found generically: the Services that select the
     examined or most abnormal components' pods, the ConfigMaps/Secrets those components reference, and objects
     the overview lists as changed shortly before the symptoms began. Ids are "<kind>/<namespace>/<name>"."""
+    from clients.jev_agent.tools.chiron import one_origin_id
+
     comps = getattr(ctx.snapshot, "components", None) or {}
     if not isinstance(comps, dict):
         comps = {}
@@ -232,12 +234,13 @@ def object_candidates(ctx: AgentContext, notebook: Notebook, scores: dict[str, f
         key=lambda c: (c not in named, c not in abnormal_targets, -scores.get(c, 0.0), c),
     )
     out: dict[str, str] = {}
+    namespaces = {ns for ns in (ctx.namespaces or []) if ns}
     if ctx.extra.get("chiron"):
         suspects = ctx.extra.get("chiron_suspects") or {}
         if isinstance(suspects, dict):
             for sid, desc in suspects.items():
                 if isinstance(sid, str) and isinstance(desc, str) and sid.count("/") in (1, 2):
-                    out.setdefault(sid, desc)
+                    out.setdefault(one_origin_id(sid, comps, namespaces), desc)
     for cid in focus:
         comp = comps.get(cid)
         if not isinstance(comp, dict):
@@ -285,7 +288,8 @@ def object_candidates(ctx: AgentContext, notebook: Notebook, scores: dict[str, f
     for change in cluster.get("recent_changes") or []:
         if not isinstance(change, dict) or not evidence.change_in_window(ctx, change):
             continue
-        obj = change.get("object")
+        raw_obj = change.get("object")
+        obj = one_origin_id(raw_obj, comps, namespaces) if isinstance(raw_obj, str) else raw_obj
         if obj and obj not in comps and obj.count("/") >= 1:
             parts = obj.split("/")
             out.setdefault(

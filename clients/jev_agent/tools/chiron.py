@@ -143,6 +143,19 @@ def _suspect_id_for(kind: str, namespace: str | None, name: str, app_namespace: 
     return _suspect_id(kind, namespace, name)
 
 
+_WORKLOAD_ID_KINDS = frozenset(kind.lower() for kind in _APP_WORKLOADS)
+
+
+def one_origin_id(obj: str, components: dict, namespaces: set[str]) -> str:
+    """Collapse kind/namespace/name for an app workload onto kind/name, the id Jev already uses."""
+    parts = obj.split("/")
+    if len(parts) == 3 and parts[0] in _WORKLOAD_ID_KINDS:
+        short = f"{parts[0]}/{parts[2]}"
+        if parts[1] in namespaces or short in components:
+            return short
+    return obj
+
+
 def _mask_literals(text: str) -> str:
     """Drop quoted text and bracketed groups so a command array cannot become an object."""
     text = re.sub(r'"[^"]*"', " ", text)
