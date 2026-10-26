@@ -12,8 +12,9 @@ from clients.jev_agent.types import MAX_FINDINGS, MAX_LINE_CHARS, AgentContext, 
 _CLIENT: ChironMcpClient | None = None
 
 # Section headers the incident brief actually uses. Order is the order Jev should see:
-# the named cause first, then other causes, then symptoms, then alerts that have gone quiet.
-SECTION_ORDER = ("MOST LIKELY", "LIKELY CAUSES", "SYMPTOMS", "EARLIER, NOW QUIET")
+# the named cause first, then other causes, then symptoms, then alerts that have gone quiet,
+# then failures that were already going on before any configuration change.
+SECTION_ORDER = ("MOST LIKELY", "LIKELY CAUSES", "SYMPTOMS", "EARLIER, NOW QUIET", "BACKGROUND")
 
 _KINDS = (
     "ValidatingWebhookConfiguration",
@@ -131,6 +132,28 @@ def _suspect_id(kind: str, namespace: str | None, name: str) -> str:
     return f"{kind_id}/{name}"
 
 
+# Workloads Jev already tracks as ``<kind>/<name>`` inside the application namespace.
+_APP_WORKLOADS = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"}
+
+
+def _suspect_id_for(kind: str, namespace: str | None, name: str, app_namespace: str | None) -> str:
+    """One id per object. A workload in the app namespace uses Jev's own id, not kind/ns/name."""
+    if app_namespace and kind in _APP_WORKLOADS and (not namespace or namespace == app_namespace):
+        return f"{kind.lower()}/{name}"
+    return _suspect_id(kind, namespace, name)
+
+
+def _mask_literals(text: str) -> str:
+    """Drop quoted text and bracketed groups so a command array cannot become an object."""
+    text = re.sub(r'"[^"]*"', " ", text)
+    text = re.sub(r"'[^']*'", " ", text)
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"\[[^\[\]]*\]", " ", text)
+    return text
+
+
 # Objects created by a controller from another object: blaming them names a symptom of the
 # change, not the change. The owner is named instead when the brief gives it.
 _DERIVED_KINDS = {"EndpointSlice", "Endpoints", "ReplicaSet"}
@@ -169,27 +192,59 @@ def _most_likely_objects(line: str) -> list[tuple[str, str | None, str]]:
     return resolved
 
 
-def suspects_from_brief(result: ToolResult) -> dict[str, str]:
-    """The object the brief's MOST LIKELY line names, as an origin choice.
+def _structured_suspects(raw: dict, app_namespace: str | None) -> dict[str, str]:
+    """Suspects the brief already ranked. Empty when the payload has none."""
+    items = raw.get("suspects")
+    if not isinstance(items, list):
+        return {}
+    found: dict[str, str] = {}
+    text = _brief_text(raw)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        name = str(item.get("name") or "")
+        namespace = item.get("namespace") or None
+        if isinstance(namespace, str) and not namespace:
+            namespace = None
+        if not kind or not name:
+            continue
+        found.setdefault(
+            _suspect_id_for(kind, namespace, name, app_namespace),
+            _suspect_desc(kind, namespace, name, text),
+        )
+        if len(found) >= MAX_SUSPECTS:
+            break
+    return found
 
-    Only MOST LIKELY: the brief has already ranked it against the other changes, and
-    every extra choice is one more plausible wrong answer for Jev. Derived objects
-    (EndpointSlice, ReplicaSet) are replaced by their owner or dropped.
+
+def suspects_from_brief(result: ToolResult, namespace: str | None = None) -> dict[str, str]:
+    """Origin choices for the brief, most likely first.
+
+    Uses ``suspects`` on the tool payload when it is present. Otherwise reads the
+    MOST LIKELY line, ignoring text inside quotes or brackets. A workload in
+    ``namespace`` is stored as ``<kind>/<name>`` so it is not also offered as
+    ``<kind>/<namespace>/<name>``.
     """
-    text = ""
-    if isinstance(result.raw, dict):
-        text = _brief_text(result.raw)
+    raw = result.raw if isinstance(result.raw, dict) else {}
+    structured = _structured_suspects(raw, namespace)
+    if structured:
+        return structured
+    text = _brief_text(raw) if raw else ""
     if not text:
         text = "\n".join(result.lines or [])
     found: dict[str, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
+    for line in text.splitlines():
+        line = line.strip()
         if not line.startswith("MOST LIKELY"):
             continue
-        # Only the change, not the symptom quoted after it.
-        change = line.split("; ", 1)[0]
-        for kind, namespace, name in _most_likely_objects(change):
-            found.setdefault(_suspect_id(kind, namespace, name), _suspect_desc(kind, namespace, name, line))
+        # Only the change, not the symptom quoted after it. Quoted and bracketed text is not an object.
+        change = _mask_literals(line.split("; ", 1)[0])
+        for kind, obj_namespace, name in _most_likely_objects(change):
+            found.setdefault(
+                _suspect_id_for(kind, obj_namespace, name, namespace),
+                _suspect_desc(kind, obj_namespace, name, line),
+            )
         if len(found) >= MAX_SUSPECTS:
             break
     return dict(list(found.items())[:MAX_SUSPECTS])

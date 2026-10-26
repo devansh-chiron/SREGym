@@ -408,7 +408,7 @@ def _collect_session(args, cfg, trace, prefix: Path, app_info: dict, namespaces:
             brief = fetch_incident_brief(ns)
             notebook.add(0, "incident_brief", ns, brief)
             if isinstance(suspects, dict):
-                suspects.update(suspects_from_brief(brief))
+                suspects.update(suspects_from_brief(brief, ns))
     return _Session(snapshot, overview, scores, ctx, cache, notebook, mcp_ok, span_label)
 
 
